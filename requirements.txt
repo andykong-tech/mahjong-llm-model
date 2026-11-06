@@ -1,0 +1,12 @@
+# Install into the existing `llm` conda env, which already has torch 2.14 (MPS) and numpy.
+# Do not pip-install torch over that conda build.
+#
+# PyMahjongGB builds a C++ extension. This Mac's Command Line Tools ship an
+# incomplete libc++ next to clang, so the build needs the SDK headers:
+#   SDK=$(xcrun --show-sdk-path)
+#   export SDKROOT="$SDK"
+#   export CXXFLAGS="-isysroot $SDK -I$SDK/usr/include/c++/v1"
+#   export CFLAGS="-isysroot $SDK"
+#   export LDFLAGS="-isysroot $SDK"
+PyMahjongGB==1.4.0
+pytest>=8
