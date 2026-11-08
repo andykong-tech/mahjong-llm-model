@@ -1,0 +1,7 @@
+{
+  "n_layer": 8,
+  "n_head": 8,
+  "n_embd": 384,
+  "block_size": 96,
+  "dropout": 0.1
+}
