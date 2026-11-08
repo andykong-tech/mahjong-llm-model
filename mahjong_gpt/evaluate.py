@@ -3,6 +3,7 @@
 Sections:
   exam        name the fans of every held-out test hand
   tricks      name the fans of hand-built hands aimed at single rules
+  given       finish a hand that must contain tiles taken from an unseen hand
   stress      generate for every possible request at rising temperatures
   impossible  requests that have no legal hand at all
   profile     compare generated hands with the training data
@@ -22,20 +23,16 @@ from mahjong_gpt.dataset import every_request, load_split
 from mahjong_gpt.grammar import parse_ids
 from mahjong_gpt.hands import hand_suits, physical_tiles
 from mahjong_gpt.infer import complete, load_model
-from mahjong_gpt.rules import MIN_FAN, score
+from mahjong_gpt.rules import MIN_FAN, fan_counter, score
 from mahjong_gpt.sampler import Request
-from mahjong_gpt.tiles import SUIT_NAMES, chow_of, suit_of
+from mahjong_gpt.tiles import SUIT_NAMES, suit_of
 from mahjong_gpt.tokenizer import MAX_SEQUENCE, Tokenizer
 from mahjong_gpt.train import pick_device
 from mahjong_gpt.trick_hands import TRICK_HANDS
 
-SECTIONS = ("exam", "tricks", "stress", "impossible", "profile")
+SECTIONS = ("exam", "tricks", "given", "stress", "impossible", "profile")
 TOTAL_BANDS = ((8, 15), (16, 31), (32, 63), (64, None))
 _MELD_PREFIXES = ("CHOW", "PUNG", "KONG")
-
-
-def fan_counter(fans) -> Counter:
-    return Counter({fan.name: fan.count for fan in fans})
 
 
 def scored_ids(tokenizer: Tokenizer, ids):
@@ -54,7 +51,7 @@ def scored_ids(tokenizer: Tokenizer, ids):
     return parsed, scored
 
 
-def grade(tokenizer: Tokenizer, ids, request: Request):
+def grade(tokenizer: Tokenizer, ids, request: Request, required: Counter | None = None):
     """Referee one generated sequence. Returns (verdict, parsed, scored)."""
     parsed, scored = scored_ids(tokenizer, ids)
     if parsed is None:
@@ -63,11 +60,13 @@ def grade(tokenizer: Tokenizer, ids, request: Request):
         return "not a win", parsed, None
     if scored[1] < MIN_FAN:
         return "under 8 fan", parsed, scored
-    tiles = _tiles(parsed)
+    tiles = parsed.tiles()
     if len(tiles) != request.tile_count:
         return "wrong tile count", parsed, scored
     if {suit_of(tile) for tile in tiles} != request.suits:
         return "wrong suits", parsed, scored
+    if required and required - Counter(tiles):
+        return "missing a given tile", parsed, scored
     return "legal", parsed, scored
 
 
@@ -163,6 +162,53 @@ def tricks(model, tokenizer: Tokenizer, device: str) -> list[tuple]:
     return [(trick, scored, Counter(guess)) for trick, scored, guess in zip(TRICK_HANDS, truths, guesses)]
 
 
+def given_tiles(model, tokenizer: Tokenizer, rows, sizes, cases: int, attempts: int, device: str, seed: int) -> dict:
+    """Take `size` tiles from an unseen winning hand and ask for any legal hand holding them.
+
+    The request keeps that hand's suits and tile count, so a legal answer exists.
+    """
+    rng = random.Random(seed)
+    results = {}
+    for size in sizes:
+        first_draw = solved = exact = draws = 0
+        verdicts: Counter = Counter()
+        started = time.time()
+        for _ in range(cases):
+            parsed, _scored = scored_ids(tokenizer, [int(token) for token in rows[rng.randrange(len(rows))] if token])
+            tiles = parsed.tiles()
+            required = Counter(rng.sample(tiles, size))
+            request = Request(frozenset(suit_of(tile) for tile in tiles), len(tiles))
+            for attempt in range(attempts):
+                draws += 1
+                ids, status = complete(
+                    model,
+                    tokenizer,
+                    tokenizer.prompt(request.suits, request.tile_count),
+                    temperature=0.8,
+                    device=device,
+                    greedy_fans=True,
+                    required=required,
+                )
+                verdict, answer, scored = grade(tokenizer, ids, request, required) if status == "done" else (status, None, None)
+                verdicts[verdict] += 1
+                if verdict != "legal":
+                    continue
+                first_draw += attempt == 0
+                solved += 1
+                exact += Counter(answer.fan_names) == fan_counter(scored[0])
+                break
+        results[size] = {
+            "cases": cases,
+            "first_draw": first_draw,
+            "solved": solved,
+            "exact": exact,
+            "draws": draws,
+            "verdicts": verdicts,
+            "seconds": time.time() - started,
+        }
+    return results
+
+
 def stress(model, tokenizer: Tokenizer, requests, temperatures, per_request: int, device: str) -> dict:
     win_id = tokenizer.stoi["<win>"]
     results = {}
@@ -249,16 +295,6 @@ def feasible_requests(data_dir: str) -> list[Request]:
     return [Request(frozenset(item["suits"]), item["tile_count"]) for item in raw]
 
 
-def _tiles(parsed) -> list[str]:
-    tiles = list(parsed.concealed) + [parsed.win_tile]
-    for kind, tile, _offer in parsed.pack:
-        if kind == "CHI":
-            tiles.extend(chow_of(tile))
-        else:
-            tiles.extend([tile] * (4 if kind == "GANG" else 3))
-    return tiles
-
-
 def _groups(tokenizer: Tokenizer, ids, truth: Counter, total: int) -> list[str]:
     names = [tokenizer.token(token) for token in ids]
     labels = ["all hands"]
@@ -327,6 +363,19 @@ def _print_tricks(results: list) -> None:
             print(f"        missed: {_names_text(truth - guess)}   added: {_names_text(guess - truth)}")
 
 
+def _print_given(results: dict, attempts: int) -> None:
+    print("\nGIVEN TILES: finish a hand that must contain tiles taken from an unseen winning hand")
+    for size, report in results.items():
+        cases = report["cases"]
+        failures = ", ".join(f"{name} {count}" for name, count in report["verdicts"].items() if name != "legal") or "none"
+        exact = f"{report['exact']}/{report['solved']}" if report["solved"] else "n/a"
+        print(
+            f"  {size:2d} tiles given: legal on the first draw {report['first_draw']}/{cases}"
+            f" ({report['first_draw'] / cases:.0%}), within {attempts} draws {report['solved']}/{cases}"
+            f"  | fans exact {exact}  | failed draws: {failures}  | {report['seconds']:.0f}s"
+        )
+
+
 def _print_stress(results: dict, requests: int, per_request: int) -> None:
     print(f"\nSTRESS: {requests} possible requests x {per_request} draw(s) per temperature")
     print("  (the hand is sampled at the temperature; fan names are taken greedily)")
@@ -374,6 +423,9 @@ def main() -> None:
     parser.add_argument("--per-request", type=int, default=1)
     parser.add_argument("--impossible-draws", type=int, default=10)
     parser.add_argument("--profile-rows", type=int, default=5000)
+    parser.add_argument("--given-sizes", default="1,3,6", help="How many tiles to give in each run")
+    parser.add_argument("--given-cases", type=int, default=50)
+    parser.add_argument("--given-attempts", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     sections = [name.strip() for name in args.sections.split(",") if name.strip()]
@@ -394,6 +446,11 @@ def main() -> None:
         _print_exam(exam(model, tokenizer, rows, device))
     if "tricks" in sections:
         _print_tricks(tricks(model, tokenizer, device))
+    if "given" in sections:
+        rows, _meta = load_split(args.data, "test")
+        sizes = [int(value) for value in args.given_sizes.split(",")]
+        report = given_tiles(model, tokenizer, rows, sizes, args.given_cases, args.given_attempts, device, args.seed)
+        _print_given(report, args.given_attempts)
     generated = None
     if "stress" in sections or "profile" in sections:
         temperatures = [float(value) for value in args.temperatures.split(",")] if "stress" in sections else [0.8]

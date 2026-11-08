@@ -9,7 +9,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from mahjong_gpt.tiles import NUMBERED_SUITS, rank_of, suit_of
+from mahjong_gpt.tiles import NUMBERED_SUITS, chow_of, rank_of, suit_of
 from mahjong_gpt.tokenizer import FAN_NAMES, MELD_TOKENS, Tokenizer
 
 _MELD_LENGTH = {
@@ -23,6 +23,7 @@ _MELD_LENGTH = {
 _DRAW = ("SELF", "DISCARD")
 _SEATS = ("SEAT_E", "SEAT_S", "SEAT_W", "SEAT_N")
 _ROUNDS = ("ROUND_E", "ROUND_S", "ROUND_W", "ROUND_N")
+_HAND_FINISHED = {"win_mark", "win", "draw", "seat", "round", "fans_mark", "fan", "done"}
 
 
 @dataclass
@@ -36,6 +37,15 @@ class ParsedHand:
     seat_wind: int
     round_wind: int
     fan_names: tuple[str, ...]
+
+    def tiles(self) -> list[str]:
+        tiles = list(self.concealed) + [self.win_tile]
+        for kind, tile, _offer in self.pack:
+            if kind == "CHI":
+                tiles.extend(chow_of(tile))
+            else:
+                tiles.extend([tile] * (4 if kind == "GANG" else 3))
+        return tiles
 
 
 @dataclass
@@ -82,8 +92,12 @@ def parse_ids(tokenizer: Tokenizer, ids: Sequence[int]) -> ParsedHand | None:
     return _finish(state)
 
 
-def allowed_next(tokenizer: Tokenizer, ids: Sequence[int]) -> set[int] | None:
-    """Token ids that may be appended. None means the sequence is already complete."""
+def allowed_next(tokenizer: Tokenizer, ids: Sequence[int], required: Counter | None = None) -> set[int] | None:
+    """Token ids that may be appended. None means the sequence is already complete.
+
+    A token is only allowed when every requested suit, and every tile in
+    `required`, can still be placed somewhere in the finished hand afterwards.
+    """
     state = _replay(tokenizer, ids)
     if state is None:
         return set()
@@ -91,9 +105,111 @@ def allowed_next(tokenizer: Tokenizer, ids: Sequence[int]) -> set[int] | None:
         return None
     allowed = set()
     for candidate in _candidates(tokenizer, state):
-        if _advance(state, candidate) is not None:
+        nxt = _advance(state, candidate)
+        if nxt is not None and _coverable(nxt, required or Counter()):
             allowed.add(tokenizer.stoi[candidate])
     return allowed
+
+
+def _coverable(state: State, required: Counter) -> bool:
+    missing = Counter(
+        {tile: need - state.counts[tile] for tile, need in required.items() if need > state.counts[tile]}
+    )
+    if any(suit_of(tile) not in state.suits for tile in missing):
+        return False
+    if state.mode in _HAND_FINISHED:
+        return not missing and not _uncovered(state.suits, state.counts)
+    if state.mode == "form":
+        uncovered = _uncovered(state.suits, state.counts + missing)
+        return sum(missing.values()) + len(uncovered) <= state.tile_count - len(state.group)
+    counts = state.counts.copy()
+    melds_left = 4 - state.melds_done
+    kongs_left = state.tile_count - 14 - state.kongs_done
+    slots: Counter = Counter()
+    if state.mode == "tiles":
+        melds_left -= 1
+        is_kong = state.group_kind.startswith("KONG")
+        if is_kong:
+            kongs_left -= 1
+        if state.group:
+            _place(_rest_of_group(state), missing, counts)
+        else:
+            slots["kong" if is_kong else state.group_kind.split("_")[0].lower()] += 1
+    slots["kong"] += kongs_left
+    slots["any"] += melds_left - kongs_left
+    if state.mode == "pair" and state.group:
+        _place([state.group[0]], missing, counts)
+    else:
+        slots["pair"] += 1
+    return _pack(+missing, slots, counts, state.suits)
+
+
+def _uncovered(suits: frozenset[str], counts: Counter) -> set[str]:
+    return set(suits) - {suit_of(tile) for tile, count in counts.items() if count > 0}
+
+
+def _suits_fit(suits: frozenset[str], slots: Counter, counts: Counter) -> bool:
+    """Each group holds one suit, and a chow can never hold winds or dragons."""
+    uncovered = _uncovered(suits, counts)
+    if not uncovered:
+        return True
+    open_slots = sum(count for count in slots.values() if count > 0)
+    honors = sum(1 for suit in uncovered if suit not in NUMBERED_SUITS)
+    return len(uncovered) <= open_slots and honors <= open_slots - max(slots["chow"], 0)
+
+
+def _rest_of_group(state: State) -> list[str]:
+    """Tiles a meld already under way will still add; its first tile fixes them."""
+    first = state.group[0]
+    if state.group_kind.startswith("CHOW"):
+        rank = rank_of(first)
+        return [f"{first[0]}{rank + offset}" for offset in range(len(state.group), 3)]
+    return [first] * (_MELD_LENGTH[state.group_kind] - len(state.group))
+
+
+def _place(tiles, missing: Counter, counts: Counter) -> None:
+    for tile in tiles:
+        counts[tile] += 1
+        if missing[tile] > 0:
+            missing[tile] -= 1
+
+
+def _pack(missing: Counter, slots: Counter, counts: Counter, suits: frozenset[str]) -> bool:
+    """Search for open melds and the pair that hold every missing tile and every missing suit."""
+    if not missing:
+        return _suits_fit(suits, slots, counts)
+    tile = min(missing)
+    for kind in ("pair", "kong", "pung", "chow", "any"):
+        if slots[kind] <= 0:
+            continue
+        for shape in _shapes(kind, tile):
+            if any(counts[t] + n > 4 for t, n in Counter(shape).items()):
+                continue
+            rest_missing = missing - Counter(shape)
+            rest_counts = counts + Counter(shape)
+            rest_slots = slots.copy()
+            rest_slots[kind] -= 1
+            if _pack(rest_missing, rest_slots, rest_counts, suits):
+                return True
+    return False
+
+
+def _shapes(kind: str, tile: str) -> list[list[str]]:
+    if kind == "pair":
+        return [[tile] * 2]
+    if kind == "kong":
+        return [[tile] * 4]
+    pung = [[tile] * 3]
+    chows = []
+    if suit_of(tile) in NUMBERED_SUITS:
+        rank = rank_of(tile)
+        for start in range(max(1, rank - 2), min(7, rank) + 1):
+            chows.append([f"{tile[0]}{start + offset}" for offset in range(3)])
+    if kind == "pung":
+        return pung
+    if kind == "chow":
+        return chows
+    return pung + chows
 
 
 def _replay(tokenizer: Tokenizer, ids: Sequence[int]) -> State | None:
