@@ -70,6 +70,10 @@ def is_legal_win(scored: tuple[tuple[Fan, ...], int] | None) -> bool:
     return scored is not None and scored[1] >= MIN_FAN
 
 
+def fan_counter(fans) -> Counter:
+    return Counter({fan.name: fan.count for fan in fans})
+
+
 def _well_formed(pack, concealed, win_tile, seat_wind, round_wind) -> bool:
     if seat_wind not in range(4) or round_wind not in range(4):
         return False
