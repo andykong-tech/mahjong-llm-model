@@ -62,10 +62,14 @@ def test_standard_kong_hand_and_thirteen_orphans_roundtrip():
 
 def test_special_forms_only_start_at_fourteen_tiles():
     tokenizer = Tokenizer()
-    forms = {index for token, index in tokenizer.stoi.items() if token.startswith("FORM_")}
-    assert forms <= allowed_next(tokenizer, tokenizer.prompt(["characters"], 14))
+    forms = {token for token in tokenizer.tokens if token.startswith("FORM_")}
+    at_fourteen = {tokenizer.token(index) for index in allowed_next(tokenizer, tokenizer.prompt(["characters"], 14))}
+    fitting = {"FORM_SEVEN_PAIRS", "FORM_SEVEN_SHIFTED_PAIRS", "FORM_NINE_GATES"}
+    assert fitting <= at_fourteen
+    assert not (forms - fitting) & at_fourteen
     for tile_count in range(15, 19):
-        assert not forms & allowed_next(tokenizer, tokenizer.prompt(["characters"], tile_count))
+        allowed = {tokenizer.token(index) for index in allowed_next(tokenizer, tokenizer.prompt(["characters"], tile_count))}
+        assert not forms & allowed
 
 
 def test_prompt_suits_follow_a_fixed_order():

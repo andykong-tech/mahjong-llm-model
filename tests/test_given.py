@@ -1,12 +1,26 @@
 import json
+import random
 from collections import Counter
 
 import pytest
 import torch
 
 from mahjong_gpt.grammar import allowed_next, parse_ids
-from mahjong_gpt.infer import check_request, complete, parse_tiles, render_hand, request_suits, tile_name
+from mahjong_gpt.hands import closed_hand
+from mahjong_gpt.infer import (
+    check_request,
+    complete,
+    generate_hands,
+    parse_tiles,
+    render_hand,
+    request_suits,
+    result_payload,
+    summary_line,
+    tile_name,
+)
 from mahjong_gpt.model import GPT, GPTConfig
+from mahjong_gpt.rules import score
+from mahjong_gpt.sampler import Request, sample_hand
 from mahjong_gpt.tokenizer import MAX_SEQUENCE, Tokenizer
 
 
@@ -102,6 +116,109 @@ def test_command_line_inputs(tmp_path):
         check_request(frozenset({"dragons"}), 14, Counter(), feasibility)
     with pytest.raises(ValueError):
         check_request(frozenset({"characters"}), 13, Counter(), feasibility)
+
+
+def test_summary_lines():
+    assert summary_line(
+        requested=10, shown=3, available=3, given=13, tile_count=14, attempts=4, impossible=False
+    ) == "Only 3 winning hands contain these 13 tiles; showing all 3."
+    assert summary_line(
+        requested=10, shown=2, available=3, given=13, tile_count=14, attempts=20, impossible=False
+    ) == "Only 3 winning hands contain these 13 tiles. Showing 2. The model did not write the other 1."
+    assert summary_line(
+        requested=10, shown=0, available=0, given=13, tile_count=14, attempts=0, impossible=True
+    ) == "No winning hand of 14 tiles contains these 13 tiles."
+    assert summary_line(
+        requested=5, shown=0, available=None, given=0, tile_count=14, attempts=0, impossible=True, hint="these suits only contain 12 tiles"
+    ) == "No winning hand of 14 tiles uses exactly these suits. These suits only contain 12 tiles."
+
+
+def test_an_unwinnable_hand_is_rejected_before_any_draw():
+    called = []
+
+    def draw(*_args, **_kwargs):
+        called.append(1)
+        return None
+
+    given = Counter({"W5": 3, "W3": 2, "W2": 4, "W9": 2, "W6": 1, "W8": 1})
+    result = generate_hands(
+        None, Tokenizer(), frozenset({"characters"}), 14, given=given, num=10, draw=draw
+    )
+    assert called == []
+    assert result.impossible
+    assert result.attempts == 0
+    assert result.hands == []
+    assert result.summary.startswith("No winning hand of 14 tiles contains these 13 tiles.")
+
+
+def test_num_counts_different_tiles_and_stops_when_only_a_few_exist():
+    tokenizer = Tokenizer()
+    base = ["W1", "W1", "W1", "W2", "W3", "W4", "W5", "W6", "W7", "W8", "W9", "W9", "W9", "W5"]
+    hand = closed_hand("nine_gates", base, "W5", random.Random(0))
+    scored = score(
+        hand.pack, hand.concealed, hand.win_tile, self_drawn=hand.self_drawn, seat_wind=hand.seat_wind, round_wind=hand.round_wind
+    )
+    ids = tokenizer.encode(["characters"], 14, hand, scored[0])
+    parsed = parse_ids(tokenizer, ids)
+    calls = {"n": 0}
+
+    def draw(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ids, parsed, scored
+        return None
+
+    given = Counter(base)
+    given["W5"] -= 1
+    result = generate_hands(
+        None,
+        tokenizer,
+        frozenset({"characters"}),
+        14,
+        given=given,
+        num=10,
+        attempts=4,
+        draw=draw,
+    )
+    assert result.available == 9
+    assert len(result.hands) == 1
+    assert result.summary == (
+        "Only 9 winning hands contain these 13 tiles. Showing 1. The model did not write the other 8."
+    )
+    payload = result_payload(tokenizer, result, given)
+    assert payload["shown"] == 1
+    assert payload["available"] == 9
+    assert payload["hands"][0]["exact"] is True
+
+
+def test_the_same_tiles_are_not_a_second_hand():
+    tokenizer = Tokenizer()
+    encoded = []
+    for seed in (1, 2):
+        hand = sample_hand(Request(frozenset({"characters"}), 14), random.Random(seed))
+        scored = score(
+            hand.pack,
+            hand.concealed,
+            hand.win_tile,
+            self_drawn=hand.self_drawn,
+            seat_wind=hand.seat_wind,
+            round_wind=hand.round_wind,
+        )
+        ids = tokenizer.encode(["characters"], 14, hand, scored[0])
+        encoded.append((ids, parse_ids(tokenizer, ids), scored))
+    sequence = [encoded[0], encoded[0], encoded[1]]
+
+    def draw(*_args, **_kwargs):
+        if sequence:
+            return sequence.pop(0)
+        return None
+
+    result = generate_hands(
+        None, tokenizer, frozenset({"characters"}), 14, num=5, attempts=5, draw=draw
+    )
+    assert len(result.hands) == 2
+    assert len({hand.tiles for hand in result.hands}) == 2
+    assert result.summary == "Stopped after 5 draws with 2 different hands."
 
 
 def test_render_marks_the_given_tiles():
