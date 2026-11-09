@@ -3,7 +3,8 @@
 Sections:
   exam        name the fans of every held-out test hand
   tricks      name the fans of hand-built hands aimed at single rules
-  given       finish a hand that must contain tiles taken from an unseen hand
+  given       finish a hand that must contain tiles taken from an unseen hand,
+              then check exact counts when few tiles are missing
   stress      generate for every possible request at rising temperatures
   impossible  requests that have no legal hand at all
   profile     compare generated hands with the training data
@@ -19,10 +20,11 @@ from pathlib import Path
 
 import torch
 
+from mahjong_gpt.completions import multiset_key, winning_multisets
 from mahjong_gpt.dataset import every_request, load_split
 from mahjong_gpt.grammar import parse_ids
 from mahjong_gpt.hands import hand_suits, physical_tiles
-from mahjong_gpt.infer import complete, load_model
+from mahjong_gpt.infer import complete, generate_hands, load_model
 from mahjong_gpt.rules import MIN_FAN, fan_counter, score
 from mahjong_gpt.sampler import Request
 from mahjong_gpt.tiles import SUIT_NAMES, suit_of
@@ -209,6 +211,76 @@ def given_tiles(model, tokenizer: Tokenizer, rows, sizes, cases: int, attempts: 
     return results
 
 
+def count_given(model, tokenizer: Tokenizer, rows, *, cases: int, num: int, device: str, seed: int, attempts: int) -> dict:
+    """Ask for `num` hands at 0, 11, 13 and 14 given tiles, and reject one unwinnable set.
+
+    A winnable set the exact list calls impossible is a false impossible. That
+    count has to stay zero. The model still writes every hand that is shown.
+    """
+    rng = random.Random(seed)
+    results = {}
+    for size in (0, 11, 13, 14):
+        false_impossible = applicable = got_exact = short = 0
+        started = time.time()
+        for _ in range(cases):
+            parsed, _scored = scored_ids(tokenizer, [int(token) for token in rows[rng.randrange(len(rows))] if token])
+            tiles = parsed.tiles()
+            original = Counter(tiles)
+            given = original.copy()
+            for tile in rng.sample(tiles, len(tiles) - size):
+                given[tile] -= 1
+                if given[tile] == 0:
+                    del given[tile]
+            suits = frozenset(suit_of(tile) for tile in tiles)
+            catalog = winning_multisets(suits, len(tiles), given)
+            if catalog is not None:
+                applicable += 1
+                if multiset_key(original) not in {multiset_key(counts) for counts in catalog}:
+                    false_impossible += 1
+            result = generate_hands(
+                model,
+                tokenizer,
+                suits,
+                len(tiles),
+                given=given,
+                num=num,
+                temperature=0.8,
+                device=device,
+                attempts=attempts,
+            )
+            goal = num if catalog is None else min(num, len(catalog))
+            if len(result.hands) == goal:
+                got_exact += 1
+            else:
+                short += 1
+        results[size] = {
+            "cases": cases,
+            "applicable": applicable,
+            "false_impossible": false_impossible,
+            "got_exact": got_exact,
+            "short": short,
+            "seconds": time.time() - started,
+        }
+    unwinnable = Counter({"W5": 3, "W3": 2, "W2": 4, "W9": 2, "W6": 1, "W8": 1})
+    started = time.time()
+    rejected = generate_hands(
+        model,
+        tokenizer,
+        frozenset({"characters"}),
+        14,
+        given=unwinnable,
+        num=num,
+        device=device,
+    )
+    results["unwinnable"] = {
+        "impossible": rejected.impossible,
+        "shown": len(rejected.hands),
+        "attempts": rejected.attempts,
+        "seconds": time.time() - started,
+    }
+    return results
+
+
 def stress(model, tokenizer: Tokenizer, requests, temperatures, per_request: int, device: str) -> dict:
     win_id = tokenizer.stoi["<win>"]
     results = {}
@@ -376,6 +448,21 @@ def _print_given(results: dict, attempts: int) -> None:
         )
 
 
+def _print_counts(results: dict, num: int) -> None:
+    print(f"\nEXACT COUNTS: {num} different hands, or every finish when fewer exist")
+    for size in (0, 11, 13, 14):
+        report = results[size]
+        rate = report["false_impossible"] / report["applicable"] if report["applicable"] else 0
+        print(
+            f"  {size:2d} tiles given: false impossible {report['false_impossible']}/{report['applicable']}"
+            f" ({rate:.0%}), showed the exact number {report['got_exact']}/{report['cases']},"
+            f" model short {report['short']}  | {report['seconds']:.0f}s"
+        )
+    rejected = results["unwinnable"]
+    outcome = "rejected" if rejected["impossible"] and rejected["shown"] == 0 else "NOT rejected"
+    print(f"  unwinnable 13 tiles: {outcome} in {rejected['attempts']} draws, {rejected['seconds']:.1f}s")
+
+
 def _print_stress(results: dict, requests: int, per_request: int) -> None:
     print(f"\nSTRESS: {requests} possible requests x {per_request} draw(s) per temperature")
     print("  (the hand is sampled at the temperature; fan names are taken greedily)")
@@ -426,6 +513,9 @@ def main() -> None:
     parser.add_argument("--given-sizes", default="1,3,6", help="How many tiles to give in each run")
     parser.add_argument("--given-cases", type=int, default=50)
     parser.add_argument("--given-attempts", type=int, default=5)
+    parser.add_argument("--count-cases", type=int, default=3, help="Hands used for the exact-count check")
+    parser.add_argument("--count-num", type=int, default=5, help="How many different hands the exact-count check asks for")
+    parser.add_argument("--count-attempts", type=int, default=16, help="Draw budget for each exact-count case")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     sections = [name.strip() for name in args.sections.split(",") if name.strip()]
@@ -451,6 +541,17 @@ def main() -> None:
         sizes = [int(value) for value in args.given_sizes.split(",")]
         report = given_tiles(model, tokenizer, rows, sizes, args.given_cases, args.given_attempts, device, args.seed)
         _print_given(report, args.given_attempts)
+        counts = count_given(
+            model,
+            tokenizer,
+            rows,
+            cases=args.count_cases,
+            num=args.count_num,
+            device=device,
+            seed=args.seed,
+            attempts=args.count_attempts,
+        )
+        _print_counts(counts, args.count_num)
     generated = None
     if "stress" in sections or "profile" in sections:
         temperatures = [float(value) for value in args.temperatures.split(",")] if "stress" in sections else [0.8]

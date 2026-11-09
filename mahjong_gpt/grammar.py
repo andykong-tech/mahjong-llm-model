@@ -8,8 +8,20 @@ fields the scorer expects.
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
+from itertools import combinations, permutations
 
-from mahjong_gpt.tiles import NUMBERED_SUITS, chow_of, rank_of, suit_of
+from mahjong_gpt.tiles import (
+    ALL_TILES,
+    DRAGONS,
+    NUMBERED_SUITS,
+    PREFIX,
+    SUIT_NAMES,
+    WINDS,
+    chow_of,
+    rank_of,
+    suit_of,
+)
 from mahjong_gpt.tokenizer import FAN_NAMES, MELD_TOKENS, Tokenizer
 
 _MELD_LENGTH = {
@@ -120,8 +132,7 @@ def _coverable(state: State, required: Counter) -> bool:
     if state.mode in _HAND_FINISHED:
         return not missing and not _uncovered(state.suits, state.counts)
     if state.mode == "form":
-        uncovered = _uncovered(state.suits, state.counts + missing)
-        return sum(missing.values()) + len(uncovered) <= state.tile_count - len(state.group)
+        return _form_possible(state.group_kind, state.group, state.suits, required)
     counts = state.counts.copy()
     melds_left = 4 - state.melds_done
     kongs_left = state.tile_count - 14 - state.kongs_done
@@ -412,14 +423,181 @@ def _take_pair_tile(state: State, token: str) -> State | None:
     return nxt
 
 
+def _tile_key(tile: str) -> tuple:
+    return (SUIT_NAMES.index(suit_of(tile)), tile)
+
+
+def _form_possible(kind: str, placed: tuple[str, ...], suits: frozenset[str], required: Counter) -> bool:
+    """True when `placed` is a sorted prefix of this special hand and the given tiles still fit."""
+    if len(placed) > 14 or any(count > 4 for count in required.values()) or sum(required.values()) > 14:
+        return False
+    if any(_tile_key(earlier) > _tile_key(later) for earlier, later in zip(placed, placed[1:])):
+        return False
+    if any(suit_of(tile) not in suits for tile in placed):
+        return False
+    if kind in _FORM_TARGETS:
+        return _matches_any(placed, suits, required, _FORM_TARGETS[kind])
+    if kind == "FORM_SEVEN_PAIRS":
+        return _seven_pairs_possible(placed, suits, required, honors_only=False)
+    if kind == "FORM_ALL_HONORS":
+        return _seven_pairs_possible(placed, suits, required, honors_only=True)
+    return False
+
+
+def _matches_any(placed, suits, required, targets) -> bool:
+    placed_tuple = tuple(placed)
+    for suit_set, ordered, counts in targets:
+        if suit_set != suits or ordered[: len(placed_tuple)] != placed_tuple:
+            continue
+        if all(counts[tile] >= need for tile, need in required.items()):
+            return True
+    return False
+
+
+def _seven_pairs_possible(placed, suits, required, *, honors_only: bool) -> bool:
+    """Seven pairs, each tile used twice or four times. All Honors is that pattern with no numbers."""
+    if honors_only and any(suit in NUMBERED_SUITS for suit in suits):
+        return False
+    pool = [
+        tile
+        for tile in ALL_TILES
+        if suit_of(tile) in suits and not (honors_only and suit_of(tile) in NUMBERED_SUITS)
+    ]
+    pool_set = set(pool)
+    if any(tile not in pool_set for tile in placed):
+        return False
+    last = placed[-1] if placed else None
+    frozen: Counter = Counter()
+    if last is not None:
+        for tile in placed:
+            if tile != last:
+                frozen[tile] += 1
+    for tile, count in frozen.items():
+        if count not in (2, 4) or count < required[tile]:
+            return False
+    for tile, need in required.items():
+        if need > frozen[tile] and last is not None and _tile_key(tile) < _tile_key(last):
+            return False
+        if need > 0 and tile not in pool_set and frozen[tile] < need:
+            return False
+    open_count = placed.count(last) if last is not None else 0
+    start = [tile for tile in pool if last is None or _tile_key(tile) >= _tile_key(last)]
+    if last is not None and (not start or start[0] != last):
+        return False
+    covered = {suit_of(tile) for tile in frozen}
+    suit_index = {suit: bit for bit, suit in enumerate(sorted(suits))}
+    need_mask = 0
+    for suit in suits:
+        if suit not in covered:
+            need_mask |= 1 << suit_index[suit]
+    slots_left = 7 - sum(count // 2 for count in frozen.values())
+
+    def finals(tile: str, is_open: bool) -> tuple[int, ...]:
+        floor = max(open_count if is_open else 0, required[tile])
+        if floor > 4:
+            return ()
+        choices = []
+        if not is_open and required[tile] == 0:
+            choices.append(0)
+        if floor <= 2:
+            choices.append(2)
+        if floor <= 4:
+            choices.append(4)
+        return tuple(choices)
+
+    @lru_cache(maxsize=None)
+    def fill(index: int, slots: int, mask: int) -> bool:
+        if slots < 0:
+            return False
+        if index == len(start):
+            return slots == 0 and mask == 0
+        tile = start[index]
+        for count in finals(tile, index == 0 and last is not None):
+            bit = 0 if count == 0 else 1 << suit_index[suit_of(tile)]
+            if fill(index + 1, slots - count // 2, mask & ~bit):
+                return True
+        return False
+
+    return fill(0, slots_left, need_mask)
+
+
+def _sorted_tiles(tiles) -> tuple[str, ...]:
+    return tuple(sorted(tiles, key=_tile_key))
+
+
+def _target(suits, tiles) -> tuple:
+    ordered = _sorted_tiles(tiles)
+    return (frozenset(suits), ordered, Counter(ordered))
+
+
+def _knitted_nines() -> list[tuple[str, ...]]:
+    """The six ways to deal 147, 258 and 369 across the three numbered suits."""
+    groups = ((1, 4, 7), (2, 5, 8), (3, 6, 9))
+    nines = []
+    for assignment in permutations(groups):
+        tiles = []
+        for suit, ranks in zip(("characters", "bamboo", "dots"), assignment):
+            prefix = PREFIX[suit]
+            tiles.extend(f"{prefix}{rank}" for rank in ranks)
+        nines.append(_sorted_tiles(tiles))
+    return nines
+
+
+def _form_targets() -> dict:
+    """Every tile list each fixed special hand can be, sorted the way the tokenizer writes them."""
+    orphans = ("W1", "W9", "T1", "T9", "B1", "B9", "F1", "F2", "F3", "F4", "J1", "J2", "J3")
+    honors = WINDS + DRAGONS
+    every_suit = frozenset(SUIT_NAMES)
+    nines = _knitted_nines()
+    targets = {
+        "FORM_THIRTEEN_ORPHANS": [
+            _target(every_suit, list(orphans) + [extra]) for extra in orphans
+        ],
+        "FORM_GREATER_HONORS_AND_KNITTED": [
+            _target(every_suit, list(chosen) + list(honors))
+            for nine in nines
+            for chosen in combinations(nine, 7)
+        ],
+        "FORM_LESSER_HONORS_AND_KNITTED": [
+            _target(every_suit, list(nine) + ["F1", "F2", "F3", "F4", "J1"]) for nine in nines
+        ],
+        "FORM_KNITTED_STRAIGHT": [],
+        "FORM_NINE_GATES": [],
+        "FORM_SEVEN_SHIFTED_PAIRS": [],
+    }
+    for nine in nines:
+        counts = Counter(nine)
+        counts["J1"] += 3
+        counts["J2"] += 2
+        targets["FORM_KNITTED_STRAIGHT"].append(
+            _target(frozenset(NUMBERED_SUITS | {"dragons"}), list(counts.elements()))
+        )
+    for suit in ("characters", "bamboo", "dots"):
+        prefix = PREFIX[suit]
+        for extra in range(1, 10):
+            tiles = [f"{prefix}1"] * 3 + [f"{prefix}{rank}" for rank in range(2, 9)] + [f"{prefix}9"] * 3
+            tiles.append(f"{prefix}{extra}")
+            targets["FORM_NINE_GATES"].append(_target(frozenset({suit}), tiles))
+        for start in (1, 2, 3):
+            tiles = [f"{prefix}{rank}" for rank in range(start, start + 7) for _ in range(2)]
+            targets["FORM_SEVEN_SHIFTED_PAIRS"].append(_target(frozenset({suit}), tiles))
+    return targets
+
+
+_FORM_TARGETS = _form_targets()
+
+
 def _take_form_tile(state: State, token: str) -> State | None:
     if not _is_tile(token) or suit_of(token) not in state.suits:
         return None
     if state.counts[token] + 1 > 4:
         return None
+    group = state.group + (token,)
+    if not _form_possible(state.group_kind, group, state.suits, Counter()):
+        return None
     nxt = state.copy()
     nxt.counts[token] += 1
-    nxt.group = state.group + (token,)
+    nxt.group = group
     if len(nxt.group) < state.tile_count:
         return nxt
     nxt.standing = list(nxt.group)
