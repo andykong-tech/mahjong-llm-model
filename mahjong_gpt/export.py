@@ -1,7 +1,7 @@
-"""Write a 16-bit copy of a checkpoint.
+"""Write a float16 copy of a checkpoint.
 
-The copy is half the size. Draw hands from it with --precision fp16, and keep
-the 32-bit original for any further training.
+Float16 is the faster 16-bit format on this Mac. The copy is half the size.
+Keep the 32-bit original for any further training.
 """
 
 import argparse

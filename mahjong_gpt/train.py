@@ -4,10 +4,12 @@ The loss ignores the prompt, the padding, and only supervises the hand and its
 fan names. Pass --overfit to memorize a few thousand examples; the loss should
 fall close to zero, which checks the data and the model before a real run.
 
---precision fp16 runs the matrix math in 16-bit and keeps layer norms and the
-loss in 32-bit. The weights, the optimizer, and the saved checkpoint stay
-32-bit, and the loss is scaled up before backward so small gradients do not
-round to zero.
+Training defaults to float16 mixed precision. On this Mac it is the faster
+16-bit format. The matrix math runs in float16, while layer norms, the loss,
+the weights, and Adam stay in 32-bit, and the saved checkpoint stays 32-bit.
+The loss is scaled up before backward so small gradients do not round to zero.
+Pass --precision bf16 for bfloat16 mixed precision, which needs no loss
+scaling, or --precision fp32 to train entirely in 32-bit.
 """
 
 import argparse
@@ -23,7 +25,7 @@ from mahjong_gpt.dataset import load_split
 from mahjong_gpt.model import GPT, GPTConfig
 from mahjong_gpt.tokenizer import Tokenizer
 
-PRECISIONS = {"fp32": torch.float32, "fp16": torch.float16}
+PRECISIONS = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
 def supervised_targets(ids: torch.Tensor, sep_id: int, pad_id: int) -> torch.Tensor:
@@ -81,7 +83,8 @@ def train(args: argparse.Namespace) -> Path:
     dtype = PRECISIONS[args.precision]
     mixed = dtype != torch.float32
     device_type = torch.device(device).type
-    scaler = torch.amp.GradScaler(device_type, enabled=mixed)
+    # Float16 underflows without loss scaling. Bfloat16 does not need it.
+    scaler = torch.amp.GradScaler(device_type, enabled=dtype == torch.float16)
 
     print(f"device {device}, precision {args.precision}, parameters {model.parameter_count():,}, rows {len(data):,}")
     model.train()
@@ -110,7 +113,7 @@ def train(args: argparse.Namespace) -> Path:
         if step % args.log_every == 0 or step + 1 == args.steps:
             elapsed = max(time.time() - started, 1e-6)
             message = f"step {step:5d}  loss {last_loss:.4f}  lr {rate:.2e}  tok/s {tokens / elapsed:,.0f}"
-            if mixed:
+            if scaler.is_enabled():
                 message += f"  scale {scaler.get_scale():.0f}"
             if len(val) and not args.overfit and step % args.eval_every == 0:
                 message += f"  val {evaluate(model, val, meta, device, args.batch_size, dtype):.4f}"
@@ -152,7 +155,12 @@ def main() -> None:
     parser.add_argument("--data", required=True)
     parser.add_argument("--out", default="checkpoints/latest.pt")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--precision", choices=sorted(PRECISIONS), default="fp32", help="fp16 trains in mixed precision")
+    parser.add_argument(
+        "--precision",
+        choices=sorted(PRECISIONS),
+        default="fp16",
+        help="fp16 mixed precision is the default on this Mac; bf16 needs no loss scaling; fp32 is 32-bit throughout",
+    )
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)

@@ -47,8 +47,8 @@ _HONOR_RANKS = {
 }
 
 
-def load_model(path: str, device: str, precision: str = "fp32") -> GPT:
-    """Load a checkpoint stored in either precision and run it in `precision`."""
+def load_model(path: str, device: str, precision: str = "fp16") -> GPT:
+    """Load a checkpoint and run it in `precision`. Float16 is the faster 16-bit format on this Mac."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     model = GPT(GPTConfig(**checkpoint["model_config"]))
     model.load_state_dict(checkpoint["model"])
@@ -463,7 +463,7 @@ def main() -> None:
     parser.add_argument("--num", type=int, default=5, help="How many hands with different tiles to write")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--precision", choices=sorted(PRECISIONS), default="fp32", help="Number format the model runs in")
+    parser.add_argument("--precision", choices=sorted(PRECISIONS), default="fp16", help="Number format the model runs in")
     parser.add_argument("--attempts", type=int, default=0, help="Draw budget; 0 picks one from how many hands were requested")
     parser.add_argument("--json", action="store_true", help="Print the hands as JSON")
     parser.add_argument("--data", default="data/hands", help="Folder holding feasibility.json")

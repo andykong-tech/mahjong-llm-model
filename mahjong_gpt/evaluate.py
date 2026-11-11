@@ -504,7 +504,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", default="checkpoints/small.pt")
     parser.add_argument("--data", default="data/hands")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--precision", choices=sorted(PRECISIONS), default="fp32", help="Number format the model runs in")
+    parser.add_argument("--precision", choices=sorted(PRECISIONS), default="fp16", help="Number format the model runs in")
     parser.add_argument("--sections", default=",".join(SECTIONS))
     parser.add_argument("--exam-rows", type=int, default=0, help="0 means the whole test split")
     parser.add_argument("--temperatures", default="0.8,1.2,1.6")
