@@ -23,7 +23,7 @@ from mahjong_gpt.model import GPT, GPTConfig
 from mahjong_gpt.rules import fan_counter, is_legal_win, score
 from mahjong_gpt.tiles import PREFIX, parse_suits, suit_capacity, suit_of
 from mahjong_gpt.tokenizer import CLOSED_FORMS, MAX_SEQUENCE, Tokenizer
-from mahjong_gpt.train import pick_device
+from mahjong_gpt.train import PRECISIONS, pick_device
 
 _DRY_STREAK = 40
 
@@ -47,10 +47,12 @@ _HONOR_RANKS = {
 }
 
 
-def load_model(path: str, device: str) -> GPT:
+def load_model(path: str, device: str, precision: str = "fp32") -> GPT:
+    """Load a checkpoint stored in either precision and run it in `precision`."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    model = GPT(GPTConfig(**checkpoint["model_config"])).to(device)
+    model = GPT(GPTConfig(**checkpoint["model_config"]))
     model.load_state_dict(checkpoint["model"])
+    model.to(device=device, dtype=PRECISIONS[precision])
     model.eval()
     return model
 
@@ -83,7 +85,7 @@ def complete(
                 return ids, "dead end"
             logits, _loss = model(torch.tensor([ids], dtype=torch.long, device=device))
             choices = sorted(allowed)
-            scores = logits[0, -1, choices]
+            scores = logits[0, -1, choices].float()
             if temperature <= 0 or (greedy_fans and in_fans):
                 pick = int(torch.argmax(scores))
             else:
@@ -461,6 +463,7 @@ def main() -> None:
     parser.add_argument("--num", type=int, default=5, help="How many hands with different tiles to write")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--precision", choices=sorted(PRECISIONS), default="fp32", help="Number format the model runs in")
     parser.add_argument("--attempts", type=int, default=0, help="Draw budget; 0 picks one from how many hands were requested")
     parser.add_argument("--json", action="store_true", help="Print the hands as JSON")
     parser.add_argument("--data", default="data/hands", help="Folder holding feasibility.json")
@@ -479,7 +482,7 @@ def main() -> None:
     def draw(model, tokenizer, suits, tile_count, *, temperature, device, required):
         # Load the checkpoint on the first real draw, so an impossible set never does.
         if "model" not in loaded:
-            loaded["model"] = load_model(args.checkpoint, device)
+            loaded["model"] = load_model(args.checkpoint, device, args.precision)
         return sample_hand(
             loaded["model"], tokenizer, suits, tile_count, temperature=temperature, device=device, required=required
         )

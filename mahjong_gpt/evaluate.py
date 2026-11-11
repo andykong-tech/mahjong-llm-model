@@ -29,7 +29,7 @@ from mahjong_gpt.rules import MIN_FAN, fan_counter, score
 from mahjong_gpt.sampler import Request
 from mahjong_gpt.tiles import SUIT_NAMES, suit_of
 from mahjong_gpt.tokenizer import MAX_SEQUENCE, Tokenizer
-from mahjong_gpt.train import pick_device
+from mahjong_gpt.train import PRECISIONS, pick_device
 from mahjong_gpt.trick_hands import TRICK_HANDS
 
 SECTIONS = ("exam", "tricks", "given", "stress", "impossible", "profile")
@@ -90,7 +90,7 @@ def name_fans(model, tokenizer: Tokenizer, prefixes, device: str, batch_size: in
         while open_rows:
             rows = sorted(open_rows)
             logits, _loss = model(block[:, : max(lengths[row] for row in rows)])
-            last = logits[rows, [lengths[row] - 1 for row in rows]]
+            last = logits[rows, [lengths[row] - 1 for row in rows]].float()
             allowed = torch.full_like(last, float("-inf"))
             allowed[:, fan_ids] = last[:, fan_ids]
             for index, row in enumerate(rows):
@@ -504,6 +504,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", default="checkpoints/small.pt")
     parser.add_argument("--data", default="data/hands")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--precision", choices=sorted(PRECISIONS), default="fp32", help="Number format the model runs in")
     parser.add_argument("--sections", default=",".join(SECTIONS))
     parser.add_argument("--exam-rows", type=int, default=0, help="0 means the whole test split")
     parser.add_argument("--temperatures", default="0.8,1.2,1.6")
@@ -525,7 +526,8 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
-    model = load_model(args.checkpoint, device)
+    model = load_model(args.checkpoint, device, args.precision)
+    print(f"{args.checkpoint} on {device} in {args.precision}")
     tokenizer = Tokenizer()
     feasible = feasible_requests(args.data)
 

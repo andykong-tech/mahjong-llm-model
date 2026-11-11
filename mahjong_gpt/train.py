@@ -3,6 +3,11 @@
 The loss ignores the prompt, the padding, and only supervises the hand and its
 fan names. Pass --overfit to memorize a few thousand examples; the loss should
 fall close to zero, which checks the data and the model before a real run.
+
+--precision fp16 runs the matrix math in 16-bit and keeps layer norms and the
+loss in 32-bit. The weights, the optimizer, and the saved checkpoint stay
+32-bit, and the loss is scaled up before backward so small gradients do not
+round to zero.
 """
 
 import argparse
@@ -17,6 +22,8 @@ import torch
 from mahjong_gpt.dataset import load_split
 from mahjong_gpt.model import GPT, GPTConfig
 from mahjong_gpt.tokenizer import Tokenizer
+
+PRECISIONS = {"fp32": torch.float32, "fp16": torch.float16}
 
 
 def supervised_targets(ids: torch.Tensor, sep_id: int, pad_id: int) -> torch.Tensor:
@@ -71,8 +78,12 @@ def train(args: argparse.Namespace) -> Path:
     weight_decay = 0.0 if args.overfit else args.weight_decay
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
     warmup = args.warmup if args.warmup < args.steps else max(1, args.steps // 10)
+    dtype = PRECISIONS[args.precision]
+    mixed = dtype != torch.float32
+    device_type = torch.device(device).type
+    scaler = torch.amp.GradScaler(device_type, enabled=mixed)
 
-    print(f"device {device}, parameters {model.parameter_count():,}, rows {len(data):,}")
+    print(f"device {device}, precision {args.precision}, parameters {model.parameter_count():,}, rows {len(data):,}")
     model.train()
     started = time.time()
     tokens = 0
@@ -85,18 +96,24 @@ def train(args: argparse.Namespace) -> Path:
         choice = np.random.randint(0, len(data), size=args.batch_size)
         batch = torch.tensor(data[choice], dtype=torch.long, device=device)
         targets = supervised_targets(batch, meta["sep_id"], meta["pad_id"])
-        _logits, loss = model(batch, targets)
+        with torch.autocast(device_type, dtype=dtype, enabled=mixed):
+            _logits, loss = model(batch, targets)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        scaler.scale(loss).backward()
+        # Clipping has to see the true gradients, not the scaled ones.
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         last_loss = float(loss.detach())
         tokens += int(batch.numel())
         if step % args.log_every == 0 or step + 1 == args.steps:
             elapsed = max(time.time() - started, 1e-6)
             message = f"step {step:5d}  loss {last_loss:.4f}  lr {rate:.2e}  tok/s {tokens / elapsed:,.0f}"
+            if mixed:
+                message += f"  scale {scaler.get_scale():.0f}"
             if len(val) and not args.overfit and step % args.eval_every == 0:
-                message += f"  val {evaluate(model, val, meta, device, args.batch_size):.4f}"
+                message += f"  val {evaluate(model, val, meta, device, args.batch_size, dtype):.4f}"
             print(message, flush=True)
 
     out = Path(args.out)
@@ -110,7 +127,9 @@ def train(args: argparse.Namespace) -> Path:
 
 
 @torch.no_grad()
-def evaluate(model: GPT, rows: np.ndarray, meta: dict, device: str, batch_size: int) -> float:
+def evaluate(
+    model: GPT, rows: np.ndarray, meta: dict, device: str, batch_size: int, dtype: torch.dtype = torch.float32
+) -> float:
     was_training = model.training
     model.eval()
     total = 0.0
@@ -118,7 +137,8 @@ def evaluate(model: GPT, rows: np.ndarray, meta: dict, device: str, batch_size: 
     for start in range(0, len(rows), batch_size):
         batch = torch.tensor(rows[start : start + batch_size], dtype=torch.long, device=device)
         targets = supervised_targets(batch, meta["sep_id"], meta["pad_id"])
-        _logits, loss = model(batch, targets)
+        with torch.autocast(torch.device(device).type, dtype=dtype, enabled=dtype != torch.float32):
+            _logits, loss = model(batch, targets)
         total += float(loss) * len(batch)
         seen += len(batch)
     if was_training:
@@ -132,6 +152,7 @@ def main() -> None:
     parser.add_argument("--data", required=True)
     parser.add_argument("--out", default="checkpoints/latest.pt")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--precision", choices=sorted(PRECISIONS), default="fp32", help="fp16 trains in mixed precision")
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
